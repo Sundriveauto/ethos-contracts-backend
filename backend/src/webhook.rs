@@ -14,6 +14,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -109,6 +110,7 @@ pub struct WebhookState {
     pub store: WebhookStore,
     pub http_client: Client,
     secrets: WebhookSecretStore,
+    webhook_clients: Arc<Mutex<HashMap<String, Client>>>,
     /// Dead-letter queue that exhausted deliveries are routed into.
     pub dlq_state: Arc<crate::dlq::DlqState>,
     /// Health-aware routing weights, keyed by webhook URL.
@@ -130,8 +132,11 @@ impl WebhookState {
         Self {
             store: create_webhook_store(),
             secrets: Arc::new(Mutex::new(HashMap::new())),
+            webhook_clients: Arc::new(Mutex::new(HashMap::new())),
             http_client: Client::builder()
                 .timeout(DELIVERY_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("webhook HTTP client configuration is valid"),
             dlq_state,
@@ -146,6 +151,100 @@ impl Default for WebhookState {
     }
 }
 
+async fn validate_and_build_webhook_client(url: &str) -> Result<(String, Client), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "url must be an absolute HTTP(S) URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("url scheme must be http or https".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not include credentials".to_string());
+    }
+
+    let host = parsed.host_str().ok_or("url must include a host")?;
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved_addresses = if let Ok(address) = ip_host.parse::<IpAddr>() {
+        if !is_public_address(address) {
+            return Err("url must not target a private or reserved IP address".to_string());
+        }
+        None
+    } else {
+        let normalized_host = host.to_ascii_lowercase();
+        if normalized_host == "localhost"
+            || normalized_host.ends_with(".localhost")
+            || normalized_host.ends_with(".local")
+            || normalized_host.ends_with(".internal")
+        {
+            return Err("url must not target a local hostname".to_string());
+        }
+
+        let port = parsed
+            .port_or_known_default()
+            .ok_or("url must include a valid port")?;
+        let lookup = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| "webhook hostname lookup timed out")?
+        .map_err(|_| "webhook hostname could not be resolved")?;
+        let addresses: Vec<SocketAddr> = lookup.collect();
+        if addresses.is_empty() {
+            return Err("webhook hostname did not resolve to any addresses".to_string());
+        }
+        if addresses
+            .iter()
+            .any(|address| !is_public_address(address.ip()))
+        {
+            return Err("url must not resolve to a private or reserved IP address".to_string());
+        }
+        Some(addresses)
+    };
+
+    let mut builder = Client::builder()
+        .timeout(DELIVERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if let Some(addresses) = resolved_addresses {
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    let client = builder
+        .build()
+        .map_err(|_| "webhook HTTP client could not be configured")?;
+
+    Ok((parsed.to_string(), client))
+}
+
+fn is_public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001
+                    && (segments[1] == 0x0000 || segments[1] == 0x0db8)
+                    || segments[0] == 0x2002)
+        }
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [first, second, third, _] = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || first == 0
+        || first >= 224
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 192 && second == 0 && (third == 0 || third == 2))
+        || (first == 192 && second == 88 && third == 99)
+        || (first == 198
+            && ((18..=19).contains(&second) || (second == 51 && third == 100)))
+        || (first == 203 && second == 0 && third == 113))
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// `POST /webhooks` — register a new webhook endpoint.
@@ -153,12 +252,15 @@ pub async fn register_webhook(
     State(state): State<Arc<WebhookState>>,
     Json(body): Json<RegisterWebhookRequest>,
 ) -> Result<(StatusCode, Json<RegisterWebhookResponse>), (StatusCode, Json<serde_json::Value>)> {
-    if body.url.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": "url must not be empty" })),
-        ));
-    }
+    let (url, webhook_client) = match validate_and_build_webhook_client(&body.url).await {
+        Ok(checked) => checked,
+        Err(error) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": error })),
+            ));
+        }
+    };
 
     let secret = body
         .secret
@@ -166,7 +268,7 @@ pub async fn register_webhook(
         .unwrap_or_else(generate_secret);
     let registration = WebhookRegistration {
         id: Uuid::new_v4().to_string(),
-        url: body.url,
+        url,
         vault_id: body.vault_id,
         event_types: body.event_types,
         algorithm: body.algorithm,
@@ -179,6 +281,11 @@ pub async fn register_webhook(
         .lock()
         .unwrap()
         .insert(registration.id.clone(), secret.clone());
+    state
+        .webhook_clients
+        .lock()
+        .unwrap()
+        .insert(registration.id.clone(), webhook_client);
     state
         .store
         .lock()
@@ -277,7 +384,19 @@ pub fn deliver_event(
             continue;
         }
 
-        let client = state.http_client.clone();
+        let client = state
+            .webhook_clients
+            .lock()
+            .unwrap()
+            .get(&registration.id)
+            .cloned();
+        let Some(client) = client else {
+            tracing::error!(
+                webhook_id = %registration.id,
+                "skipping delivery — no validated webhook HTTP client is configured"
+            );
+            continue;
+        };
         let payload_clone = payload.clone();
         let state_clone = Arc::clone(&state);
 
@@ -752,7 +871,7 @@ mod tests {
     async fn test_every_registration_is_assigned_a_signing_secret() {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![],
             secret: None,
@@ -791,7 +910,7 @@ mod tests {
     async fn test_secret_rotation_invalidates_old_signatures() {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![],
             secret: Some("original-secret".to_string()),
@@ -1044,7 +1163,7 @@ mod tests {
     async fn test_register_webhook_creates_registration() {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![],
             secret: None,
@@ -1063,7 +1182,7 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored.get(&reg.registration.id).unwrap().url,
-            "https://example.test/hook"
+            "https://1.1.1.1/hook"
         );
     }
 
@@ -1083,12 +1202,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_webhook_url_validation_rejects_private_destinations() {
+        for url in [
+            "http://169.254.169.254/",
+            "http://localhost:5432/",
+            "http://127.0.0.1:5432/",
+            "http://[::1]:5432/",
+            "http://[::ffff:127.0.0.1]:5432/",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_and_build_webhook_client(url).await.is_err(),
+                "unsafe webhook URL was accepted: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_list_webhooks_returns_all_registrations() {
         let state = Arc::new(WebhookState::new());
 
         for i in 0..3 {
             let req = RegisterWebhookRequest {
-                url: format!("https://example.test/hook-{i}"),
+                url: format!("https://1.1.1.1/hook-{i}"),
                 vault_id: None,
                 event_types: vec![],
                 secret: None,
@@ -1113,7 +1249,7 @@ mod tests {
     async fn test_delete_webhook_deactivates_registration() {
         let state = Arc::new(WebhookState::new());
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![],
             secret: None,
@@ -1148,7 +1284,7 @@ mod tests {
 
         // Register webhook for vault-1
         let req1 = RegisterWebhookRequest {
-            url: "https://example.test/hook1".to_string(),
+            url: "https://1.1.1.1/hook1".to_string(),
             vault_id: Some("vault-1".to_string()),
             event_types: vec![],
             secret: None,
@@ -1160,7 +1296,7 @@ mod tests {
 
         // Register webhook for vault-2
         let req2 = RegisterWebhookRequest {
-            url: "https://example.test/hook2".to_string(),
+            url: "https://1.1.1.1/hook2".to_string(),
             vault_id: Some("vault-2".to_string()),
             event_types: vec![],
             secret: None,
@@ -1200,7 +1336,7 @@ mod tests {
 
         // Register webhook for specific event types
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![WebhookEventType::VaultCreated, WebhookEventType::VaultCheckedIn],
             secret: None,
@@ -1279,7 +1415,7 @@ mod tests {
 
         // Register and then deactivate a webhook
         let req = RegisterWebhookRequest {
-            url: "https://example.test/hook".to_string(),
+            url: "https://1.1.1.1/hook".to_string(),
             vault_id: None,
             event_types: vec![],
             secret: None,
@@ -1348,7 +1484,7 @@ mod tests {
 
         for _ in 0..5 {
             let req = RegisterWebhookRequest {
-                url: format!("https://example.test/hook{}", uuid::Uuid::new_v4()),
+                url: format!("https://1.1.1.1/hook{}", uuid::Uuid::new_v4()),
                 vault_id: None,
                 event_types: vec![],
                 secret: None,
