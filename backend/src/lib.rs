@@ -36,6 +36,7 @@ pub mod dr_automation;
 pub mod error;
 pub mod error_context;
 pub mod event_sourcing;
+pub mod encryption;
 pub mod fallback;
 pub mod feature_flags;
 pub mod fraud_detection;
