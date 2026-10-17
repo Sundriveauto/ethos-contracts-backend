@@ -53,8 +53,6 @@ pub struct WebhookRegistration {
     pub vault_id: Option<String>,
     /// Event types to deliver; empty = all event types.
     pub event_types: Vec<WebhookEventType>,
-    /// HMAC secret used to sign payloads (optional).
-    pub secret: Option<String>,
     /// Algorithm used for HMAC signing. Defaults to SHA-256.
     #[serde(default)]
     pub algorithm: SignatureAlgorithm,
@@ -88,9 +86,18 @@ pub struct WebhookPayload {
 // ── In-memory store ───────────────────────────────────────────────────────────
 
 pub type WebhookStore = Arc<Mutex<HashMap<String, WebhookRegistration>>>;
+type WebhookSecretStore = Arc<Mutex<HashMap<String, String>>>;
 
 pub fn create_webhook_store() -> WebhookStore {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+#[derive(Serialize)]
+pub struct RegisterWebhookResponse {
+    #[serde(flatten)]
+    pub registration: WebhookRegistration,
+    /// Returned once at creation or rotation; never included in registry listings.
+    pub secret: String,
 }
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -101,6 +108,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct WebhookState {
     pub store: WebhookStore,
     pub http_client: Client,
+    secrets: WebhookSecretStore,
     /// Dead-letter queue that exhausted deliveries are routed into.
     pub dlq_state: Arc<crate::dlq::DlqState>,
     /// Health-aware routing weights, keyed by webhook URL.
@@ -121,6 +129,7 @@ impl WebhookState {
     ) -> Self {
         Self {
             store: create_webhook_store(),
+            secrets: Arc::new(Mutex::new(HashMap::new())),
             http_client: Client::builder()
                 .timeout(DELIVERY_TIMEOUT)
                 .build()
@@ -143,7 +152,7 @@ impl Default for WebhookState {
 pub async fn register_webhook(
     State(state): State<Arc<WebhookState>>,
     Json(body): Json<RegisterWebhookRequest>,
-) -> Result<(StatusCode, Json<WebhookRegistration>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<RegisterWebhookResponse>), (StatusCode, Json<serde_json::Value>)> {
     if body.url.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -151,24 +160,38 @@ pub async fn register_webhook(
         ));
     }
 
+    let secret = body
+        .secret
+        .filter(|secret| !secret.is_empty())
+        .unwrap_or_else(generate_secret);
     let registration = WebhookRegistration {
         id: Uuid::new_v4().to_string(),
         url: body.url,
         vault_id: body.vault_id,
         event_types: body.event_types,
-        // #351: every registration is given a signing secret so that *every*
-        // outbound payload is HMAC-signed, even when the caller did not supply
-        // one. The generated secret is returned in the response body once.
-        secret: Some(body.secret.filter(|s| !s.is_empty()).unwrap_or_else(generate_secret)),
         algorithm: body.algorithm,
         created_at: Utc::now(),
         active: true,
     };
 
-    let mut store = state.store.lock().unwrap();
-    store.insert(registration.id.clone(), registration.clone());
+    state
+        .secrets
+        .lock()
+        .unwrap()
+        .insert(registration.id.clone(), secret.clone());
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert(registration.id.clone(), registration.clone());
 
-    Ok((StatusCode::CREATED, Json(registration)))
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterWebhookResponse {
+            registration,
+            secret,
+        }),
+    ))
 }
 
 /// `GET /webhooks` — list all registered webhooks.
@@ -217,8 +240,9 @@ pub fn deliver_event(
         data,
     };
 
-    let registrations: Vec<WebhookRegistration> = {
+    let registrations: Vec<(WebhookRegistration, Option<String>)> = {
         let store = state.store.lock().unwrap();
+        let secrets = state.secrets.lock().unwrap();
         store
             .values()
             .filter(|wh| {
@@ -237,11 +261,11 @@ pub fn deliver_event(
                 }
                 true
             })
-            .cloned()
+            .map(|wh| (wh.clone(), secrets.get(&wh.id).cloned()))
             .collect()
     };
 
-    for registration in registrations {
+    for (registration, secret) in registrations {
         // Health-aware routing (#4): skip endpoints that have been failing
         // consistently rather than continuing to hammer them.
         if !crate::health_routing::should_route(&state.health_routing_state, &registration.url) {
@@ -258,7 +282,14 @@ pub fn deliver_event(
         let state_clone = Arc::clone(&state);
 
         tokio::spawn(async move {
-            attempt_delivery(&client, &registration, &payload_clone, &state_clone).await;
+            attempt_delivery(
+                &client,
+                &registration,
+                secret.as_deref(),
+                &payload_clone,
+                &state_clone,
+            )
+            .await;
         });
     }
 }
@@ -271,6 +302,7 @@ const BASE_DELAY_MS: u64 = 250;
 async fn attempt_delivery(
     client: &Client,
     registration: &WebhookRegistration,
+    secret: Option<&str>,
     payload: &WebhookPayload,
     state: &WebhookState,
 ) {
@@ -295,11 +327,7 @@ async fn attempt_delivery(
             .header("X-Ethos-Delivery", &payload.id)
             .body(body.clone());
 
-        // Add HMAC signature + timestamp headers. Every registration carries a
-        // secret (see `register_webhook`), so this branch is always taken for
-        // registrations created through the API; the `if let` only guards
-        // hand-constructed registrations used in tests.
-        if let Some(ref secret) = registration.secret {
+        if let Some(secret) = secret {
             let (signature, timestamp) =
                 build_signature_headers(&body, secret, registration.algorithm);
             req = req
@@ -681,17 +709,20 @@ pub async fn rotate_webhook_secret(
     State(state): State<Arc<WebhookState>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mut store = state.store.lock().unwrap();
-    match store.get_mut(&id) {
-        Some(wh) => {
-            let new_secret = generate_secret();
-            wh.secret = Some(new_secret.clone());
-            Ok(Json(serde_json::json!({
-                "id": id,
-                "secret": new_secret,
-            })))
-        }
-        None => Err(StatusCode::NOT_FOUND),
+    let exists = state.store.lock().unwrap().contains_key(&id);
+    if exists {
+        let new_secret = generate_secret();
+        state
+            .secrets
+            .lock()
+            .unwrap()
+            .insert(id.clone(), new_secret.clone());
+        Ok(Json(serde_json::json!({
+            "id": id,
+            "secret": new_secret,
+        })))
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
@@ -728,12 +759,13 @@ mod tests {
             algorithm: SignatureAlgorithm::Sha256,
         };
 
-        let (status, Json(reg)) = register_webhook(State(state), Json(req)).await.unwrap();
+        let (status, Json(reg)) = register_webhook(State(state.clone()), Json(req)).await.unwrap();
 
         assert_eq!(status, StatusCode::CREATED);
-        let secret = reg.secret.expect("registration must carry a signing secret");
+        let secret = reg.secret;
         assert!(secret.starts_with("whsec_"), "unexpected secret: {secret}");
         assert!(secret.len() > 16);
+        assert!(state.secrets.lock().unwrap().contains_key(&reg.registration.id));
     }
 
     #[test]
@@ -767,16 +799,22 @@ mod tests {
         };
         let (_, Json(reg)) = register_webhook(State(state.clone()), Json(req)).await.unwrap();
         let body = r#"{"event":"vault_created"}"#;
-        let old_sig = standard_signature_256(body, reg.secret.as_deref().unwrap());
+        let old_sig = standard_signature_256(body, &reg.secret);
 
-        let Json(rot) = rotate_webhook_secret(State(state.clone()), Path(reg.id.clone()))
-            .await
-            .unwrap();
+        let Json(rot) =
+            rotate_webhook_secret(State(state.clone()), Path(reg.registration.id.clone()))
+                .await
+                .unwrap();
         let new_secret = rot["secret"].as_str().unwrap().to_string();
         assert_ne!(new_secret, "original-secret");
 
-        let stored = state.store.lock().unwrap().get(&reg.id).unwrap().clone();
-        assert_eq!(stored.secret.as_deref(), Some(new_secret.as_str()));
+        let stored_secret = state
+            .secrets
+            .lock()
+            .unwrap()
+            .get(&reg.registration.id)
+            .cloned();
+        assert_eq!(stored_secret.as_deref(), Some(new_secret.as_str()));
 
         let new_sig = standard_signature_256(body, &new_secret);
         assert_ne!(old_sig, new_sig, "rotation must change the signature");
@@ -809,8 +847,6 @@ mod tests {
             url: format!("{}/hook", server.url()),
             vault_id: None,
             event_types: vec![],
-            // A non-256 algorithm configured: X-Signature-256 must still be SHA-256.
-            secret: Some("delivery-secret".to_string()),
             algorithm: SignatureAlgorithm::Sha512,
             created_at: Utc::now(),
             active: true,
@@ -819,6 +855,7 @@ mod tests {
         attempt_delivery(
             &state.http_client,
             &registration,
+            Some("delivery-secret"),
             &sample_payload("d1"),
             &state,
         )
@@ -853,7 +890,6 @@ mod tests {
             url: format!("{}/hook", server.url()),
             vault_id: None,
             event_types: vec![],
-            secret: None, // hand-built registration: payloads go out unsigned
             algorithm: SignatureAlgorithm::Sha256,
             created_at: Utc::now(),
             active: true,
@@ -862,6 +898,7 @@ mod tests {
         attempt_delivery(
             &state.http_client,
             &registration,
+            None,
             &sample_payload("d2"),
             &state,
         )
@@ -1019,12 +1056,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, StatusCode::CREATED);
-        assert!(!reg.id.is_empty());
-        assert!(reg.active);
+        assert!(!reg.registration.id.is_empty());
+        assert!(reg.registration.active);
 
         let stored = state.store.lock().unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored.get(&reg.id).unwrap().url, "https://example.test/hook");
+        assert_eq!(
+            stored.get(&reg.registration.id).unwrap().url,
+            "https://example.test/hook"
+        );
     }
 
     #[tokio::test]
@@ -1061,6 +1101,12 @@ mod tests {
 
         let Json(webhooks) = list_webhooks(State(state)).await;
         assert_eq!(webhooks.len(), 3);
+        let webhooks = serde_json::to_value(webhooks).unwrap();
+        assert!(webhooks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|webhook| webhook.get("secret").is_none()));
     }
 
     #[tokio::test]
@@ -1078,11 +1124,15 @@ mod tests {
             .await
             .unwrap();
 
-        let status = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
+        let status = delete_webhook(
+            State(state.clone()),
+            Path(reg.registration.id.clone()),
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let stored = state.store.lock().unwrap();
-        assert!(!stored.get(&reg.id).unwrap().active);
+        assert!(!stored.get(&reg.registration.id).unwrap().active);
     }
 
     #[tokio::test]
@@ -1239,7 +1289,11 @@ mod tests {
             .await
             .unwrap();
 
-        let _ = delete_webhook(State(state.clone()), Path(reg.id.clone())).await;
+        let _ = delete_webhook(
+            State(state.clone()),
+            Path(reg.registration.id.clone()),
+        )
+        .await;
 
         // Deactivated webhooks should not match
         let matching: Vec<WebhookRegistration> = {
@@ -1305,7 +1359,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let secret = reg.secret.unwrap();
+            let secret = reg.secret;
             assert!(secret.starts_with("whsec_"), "secret should have whsec_ prefix");
             assert!(secret.len() > 30, "secret should be long enough");
         }
